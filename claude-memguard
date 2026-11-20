@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""Kill runaway processes launched by AI desktop apps before they exhaust memory.
+
+macOS ignores RLIMIT memory limits and has no cgroups, so this polls instead.
+Every process a guarded desktop app launches (agent sessions, their shells,
+and anything those spawn, even orphaned background jobs) shares the app's
+resource coalition, so membership is read from the coalition rather than the
+parent chain. The app bundles themselves are never killed; a killed command
+shows up in the agent as exit 137 / "Killed: 9".
+
+Rules, checked every interval, all SIGKILL:
+  1. any one process over the per-process limit
+  2. one app's launched processes together over the total limit -> its largest
+  3. system memory free at or under the free floor -> largest overall (>= 1 GB)
+
+Limits default to a share of physical RAM (per-process 33%, total 55%). Set
+them in the config file or with flags, as GB (12), with a unit (12G, 512M), as
+a share of RAM (33%), or "off".
+
+commands:
+  run        run the guard in the foreground (what the launchd agent runs)
+  status     show the limits in effect and what is guarded right now
+  install    install the script and a launchd agent that starts at login
+  uninstall  stop and remove the launchd agent
+"""
+
+import argparse
+import configparser
+import ctypes
+import ctypes.util
+import datetime
+import os
+import plistlib
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Dict, List, NamedTuple, Optional, Tuple
+
+GB = 1024**3
+MB = 1024**2
+PROC_PIDCOALITIONINFO = 20
+RUSAGE_INFO_V2 = 2
+
+LABEL = "local.claude-memguard"
+CONFIG_PATH = "~/.config/claude-memguard/config.ini"
+INSTALL_PATH = "~/.local/bin/claude-memguard"
+PLIST_PATH = f"~/Library/LaunchAgents/{LABEL}.plist"
+LOG_PATH = "~/Library/Logs/claude-memguard.log"
+
+DEFAULTS = {
+    "per_process": "33%",
+    "total": "55%",
+    "min_free_pct": "10",
+    "interval": "1",
+    "cooldown": "3",
+    "notify": "true",
+    "apps": "/Applications/Claude.app/\n/Applications/ChatGPT.app/",
+    "protect": "/System/Library/",
+}
+
+EXAMPLE_CONFIG = """\
+# claude-memguard settings. Uncomment a line to change it.
+# The running guard picks up edits within a second.
+#
+# Limits take GB (12), a unit (12G, 512M), a share of physical RAM (33%),
+# or off. min_free_pct = 0 turns the free-memory rule off.
+
+[memguard]
+# per_process = 33%
+# total = 55%
+# min_free_pct = 10
+# interval = 1
+# cooldown = 3
+# notify = true
+
+# Everything these apps launch is guarded. One app bundle per line.
+# apps =
+#     /Applications/Claude.app
+#     /Applications/ChatGPT.app
+
+# Executables under these prefixes count toward the total but are never
+# killed. The default covers macOS services an app runs in its coalition,
+# such as the Claude app's virtual machine.
+# protect =
+#     /System/Library/
+"""
+
+libproc = ctypes.CDLL(ctypes.util.find_library("proc"))
+libc = ctypes.CDLL(None)
+
+
+class RusageInfoV2(ctypes.Structure):
+    _fields_ = [("uuid", ctypes.c_uint8 * 16)] + [
+        (name, ctypes.c_uint64)
+        for name in (
+            "user_time", "system_time", "pkg_idle_wkups", "interrupt_wkups",
+            "pageins", "wired_size", "resident_size", "phys_footprint",
+            "proc_start_abstime", "proc_exit_abstime", "child_user_time",
+            "child_system_time", "child_pkg_idle_wkups",
+            "child_interrupt_wkups", "child_pageins", "child_elapsed_abstime",
+            "diskio_bytesread", "diskio_byteswritten",
+        )
+    ]
+
+
+class Proc(NamedTuple):
+    pid: int
+    exe: str
+    footprint: int
+    app: str
+    protected: bool = False
+
+
+class Settings(NamedTuple):
+    per_process: Optional[int]
+    total: Optional[int]
+    min_free_pct: int
+    interval: float
+    cooldown: float
+    notify: bool
+    apps: Tuple[str, ...]
+    protect: Tuple[str, ...]
+
+
+# --- settings ---------------------------------------------------------------
+
+
+def round_half_gb(size: float) -> int:
+    half = GB // 2
+    return max(half, int(round(size / half)) * half)
+
+
+def parse_limit(text: str, ram: int) -> Optional[int]:
+    """'12', '12G', '12GB', '512M', '33%' -> bytes; 'off' -> None."""
+    if text.strip().lower() in ("off", "none"):
+        return None
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(%|[gGmM][bB]?)?\s*", text)
+    if not match or float(match.group(1)) <= 0:
+        raise ValueError(f"{text!r} is not a memory limit (use 12, 12G, 512M, 33% or off)")
+    number, unit = float(match.group(1)), (match.group(2) or "g").lower()
+    if unit == "%":
+        if number > 100:
+            raise ValueError(f"{text!r} is more than 100% of RAM")
+        return round_half_gb(ram * number / 100)
+    return int(number * (MB if unit.startswith("m") else GB))
+
+
+def parse_bool(text: str) -> bool:
+    value = text.strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"{text!r} is not true or false")
+
+
+def parse_number(text: str, minimum: float, maximum: float = float("inf")) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise ValueError(f"{text!r} is not a number") from None
+    if not minimum <= value <= maximum:
+        raise ValueError(f"{text!r} is outside {minimum:g}..{maximum:g}")
+    return value
+
+
+def parse_paths(text: str, directory: bool = False) -> Tuple[str, ...]:
+    paths = [os.path.expanduser(p.strip()) for p in re.split(r"[\n,]", text) if p.strip()]
+    return tuple(p.rstrip("/") + "/" if directory else p for p in paths)
+
+
+def read_config(path: str) -> Dict[str, str]:
+    if not os.path.exists(path):
+        return {}
+    parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
+    parser.read(path)
+    if not parser.has_section("memguard"):
+        return {}
+    section = dict(parser["memguard"])
+    unknown = sorted(set(section) - set(DEFAULTS))
+    if unknown:
+        raise ValueError(f"{path}: unknown setting {', '.join(unknown)}")
+    return section
+
+
+def gather(config: Dict[str, str], flags: Dict[str, str]) -> Dict[str, Tuple[str, str]]:
+    """Each setting's raw value and where it came from: flag > config > default."""
+    raw = {key: (value, "default") for key, value in DEFAULTS.items()}
+    raw.update({key: (value, "config") for key, value in config.items()})
+    raw.update({key: (value, "flag") for key, value in flags.items()})
+    return raw
+
+
+def resolve(raw: Dict[str, Tuple[str, str]], ram: int) -> Settings:
+    def field(key, parse):
+        try:
+            return parse(raw[key][0])
+        except ValueError as error:
+            raise ValueError(f"{key} ({raw[key][1]}): {error}") from None
+
+    return Settings(
+        per_process=field("per_process", lambda t: parse_limit(t, ram)),
+        total=field("total", lambda t: parse_limit(t, ram)),
+        min_free_pct=int(field("min_free_pct", lambda t: parse_number(t, 0, 100))),
+        interval=field("interval", lambda t: parse_number(t, 0.1)),
+        cooldown=field("cooldown", lambda t: parse_number(t, 0)),
+        notify=field("notify", parse_bool),
+        apps=field("apps", lambda t: parse_paths(t, directory=True)),
+        protect=field("protect", parse_paths),
+    )
+
+
+def flag_overrides(args: argparse.Namespace) -> Dict[str, str]:
+    values = {
+        "per_process": args.per_process,
+        "total": args.total,
+        "min_free_pct": args.min_free_pct,
+        "interval": args.interval,
+        "cooldown": args.cooldown,
+        "notify": "false" if args.no_notify else None,
+        "apps": "\n".join(args.app) if args.app else None,
+        "protect": "\n".join(args.protect) if args.protect else None,
+    }
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def load_settings(args: argparse.Namespace) -> Tuple[Settings, Dict[str, Tuple[str, str]]]:
+    raw = gather(read_config(args.config), flag_overrides(args))
+    return resolve(raw, physical_ram()), raw
+
+
+# --- system -----------------------------------------------------------------
+
+
+def sysctl_int(name: bytes, ctype) -> Optional[int]:
+    value = ctype(0)
+    size = ctypes.c_size_t(ctypes.sizeof(value))
+    rc = libc.sysctlbyname(name, ctypes.byref(value), ctypes.byref(size), None, 0)
+    return value.value if rc == 0 else None
+
+
+def physical_ram() -> int:
+    ram = sysctl_int(b"hw.memsize", ctypes.c_uint64)
+    if not ram:
+        raise OSError("could not read hw.memsize")
+    return ram
+
+
+def memory_free_pct() -> Optional[int]:
+    return sysctl_int(b"kern.memorystatus_level", ctypes.c_int)
+
+
+def all_pids() -> List[int]:
+    buf = (ctypes.c_int * 8192)()
+    n = libproc.proc_listallpids(buf, ctypes.sizeof(buf))
+    return [p for p in buf[: max(n, 0)] if p > 0]
+
+
+def coalition(pid: int) -> Optional[int]:
+    ids = (ctypes.c_uint64 * 5)()
+    got = libproc.proc_pidinfo(pid, PROC_PIDCOALITIONINFO, 0, ids, ctypes.sizeof(ids))
+    return ids[0] if got == ctypes.sizeof(ids) else None
+
+
+def exe_path(pid: int) -> str:
+    buf = ctypes.create_string_buffer(4096)
+    return buf.value.decode(errors="replace") if libproc.proc_pidpath(pid, buf, 4096) > 0 else ""
+
+
+def footprint(pid: int) -> Optional[int]:
+    info = RusageInfoV2()
+    ok = libproc.proc_pid_rusage(pid, RUSAGE_INFO_V2, ctypes.byref(info)) == 0
+    return info.phys_footprint if ok else None
+
+
+def command_line(pid: int) -> str:
+    out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)], capture_output=True, text=True)
+    return out.stdout.strip() or exe_path(pid)
+
+
+def app_name(bundle: str) -> str:
+    return os.path.basename(bundle.rstrip("/")).removesuffix(".app")
+
+
+def guarded_processes(apps: Tuple[str, ...], protect: Tuple[str, ...]) -> List[Proc]:
+    """Processes sharing a coalition with one of `apps`, minus the apps' own bundles."""
+    members = [(pid, coalition(pid), exe_path(pid)) for pid in all_pids()]
+    owner = {coal: app for _, coal, exe in members for app in apps if coal is not None and exe.startswith(app)}
+    procs = []
+    for pid, coal, exe in members:
+        app = owner.get(coal)
+        if app is None or exe.startswith(apps) or pid == os.getpid():
+            continue
+        size = footprint(pid)
+        if size:
+            procs.append(Proc(pid, exe, size, app_name(app), exe.startswith(protect)))
+    return sorted(procs, key=lambda p: -p.footprint)
+
+
+# --- guard ------------------------------------------------------------------
+
+
+def fmt_gb(size: int) -> str:
+    return f"{size / GB:.1f}".removesuffix(".0") + " GB"
+
+
+def fmt_limit(size: Optional[int]) -> str:
+    return fmt_gb(size) if size is not None else "off"
+
+
+def pick_victims(procs: List[Proc], s: Settings, free_pct: Optional[int]) -> List[Tuple[Proc, str]]:
+    killable = [p for p in procs if not p.protected]
+    if s.per_process is not None:
+        over = [(p, f"over the {fmt_gb(s.per_process)} per-process limit") for p in killable if p.footprint > s.per_process]
+        if over:
+            return over
+    if s.total is not None:
+        for app in dict.fromkeys(p.app for p in procs):
+            total = sum(p.footprint for p in procs if p.app == app)
+            victim = next((p for p in killable if p.app == app), None)
+            if total > s.total and victim:
+                return [(victim, f"{app}-launched processes total {total / GB:.1f} GB, over the {fmt_gb(s.total)} budget")]
+    if s.min_free_pct and free_pct is not None and free_pct <= s.min_free_pct and killable and killable[0].footprint >= GB:
+        return [(killable[0], f"system memory free at {free_pct}% (floor {s.min_free_pct}%)")]
+    return []
+
+
+def log(message: str) -> None:
+    print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {message}", flush=True)
+
+
+def notify(message: str) -> None:
+    text = message.replace("\\", "\\\\").replace('"', '\\"')
+    subprocess.Popen(
+        ["osascript", "-e", f'display notification "{text}" with title "Memory guard" sound name "Basso"'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+
+def kill(proc: Proc, reason: str, s: Settings, dry_run: bool) -> None:
+    cmd = command_line(proc.pid)
+    if not dry_run:
+        try:
+            os.kill(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+    log(f"{'WOULD KILL' if dry_run else 'KILLED'} {proc.app} pid {proc.pid} at {proc.footprint / GB:.1f} GB: {reason} :: {cmd[:400]}")
+    if s.notify and not dry_run:
+        notify(f"Killed {proc.app}'s {os.path.basename(proc.exe)} ({proc.footprint / GB:.1f} GB): {reason}")
+
+
+def fmt_floor(pct: int) -> str:
+    return f"{pct}%" if pct else "off"
+
+
+def describe(s: Settings) -> str:
+    apps = ", ".join(map(app_name, s.apps))
+    return f"per-process {fmt_limit(s.per_process)}, total {fmt_limit(s.total)}, free floor {fmt_floor(s.min_free_pct)}, apps {apps}"
+
+
+def config_mtime(path: str) -> Optional[float]:
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def run(args: argparse.Namespace) -> None:
+    s, _ = load_settings(args)
+    log(f"start: {describe(s)}{' (dry run)' if args.dry_run else ''}")
+    seen = config_mtime(args.config)
+    while True:
+        mtime = config_mtime(args.config)
+        if mtime != seen:
+            seen = mtime
+            try:
+                s, _ = load_settings(args)
+                log(f"config reloaded: {describe(s)}")
+            except ValueError as error:
+                log(f"config not reloaded, keeping previous limits: {error}")
+        procs = guarded_processes(s.apps, s.protect)
+        if args.only_pid is not None:
+            procs = [p for p in procs if p.pid == args.only_pid]
+        victims = pick_victims(procs, s, memory_free_pct())
+        for proc, reason in victims:
+            kill(proc, reason, s, args.dry_run)
+        time.sleep(s.cooldown if victims and not args.dry_run else s.interval)
+
+
+# --- status / install -------------------------------------------------------
+
+
+def agent_loaded() -> bool:
+    out = subprocess.run(["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
+    return out.returncode == 0
+
+
+def status(args: argparse.Namespace) -> None:
+    s, raw = load_settings(args)
+    ram = physical_ram()
+
+    def source(key: str) -> str:
+        value, origin = raw[key]
+        share = f"{value.strip()} of {fmt_gb(ram)} RAM, " if value.strip().endswith("%") else ""
+        return f"({share}{origin})"
+
+    print(f"memory free     {memory_free_pct()}%")
+    print(f"per-process     {fmt_limit(s.per_process):<8} {source('per_process')}")
+    print(f"total per app   {fmt_limit(s.total):<8} {source('total')}")
+    print(f"free floor      {fmt_floor(s.min_free_pct):<8} {source('min_free_pct')}")
+    print(f"protected       {', '.join(s.protect) or 'none'}")
+    print(f"config          {args.config}{'' if os.path.exists(args.config) else ' (not found, using defaults)'}")
+    print(f"launchd agent   {'running' if agent_loaded() else 'not installed'}")
+    procs = guarded_processes(s.apps, s.protect)
+    for bundle in s.apps:
+        app = app_name(bundle)
+        launched = [p for p in procs if p.app == app]
+        budget = f" of {fmt_gb(s.total)} budget" if s.total is not None else ""
+        print(f"\n{app}: {len(launched)} procs, {sum(p.footprint for p in launched) / GB:.1f} GB{budget}")
+        for p in launched[:6]:
+            mark = " [protected]" if p.protected else ""
+            print(f"  {p.footprint / GB:6.2f} GB  pid {p.pid:<6}{mark} {command_line(p.pid)[:100]}")
+
+
+def launchctl_bootstrap(plist: str) -> None:
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", f"{domain}/{LABEL}"], capture_output=True)
+    for _ in range(10):
+        out = subprocess.run(["launchctl", "bootstrap", domain, plist], capture_output=True, text=True)
+        if out.returncode == 0:
+            return
+        time.sleep(0.5)
+    sys.exit(f"launchctl bootstrap failed: {out.stderr.strip()}")
+
+
+def install(args: argparse.Namespace) -> None:
+    load_settings(args)
+    target = os.path.expanduser(INSTALL_PATH)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if os.path.realpath(__file__) != os.path.realpath(target):
+        shutil.copy2(os.path.realpath(__file__), target)
+    os.chmod(target, 0o755)
+
+    if not os.path.exists(args.config):
+        os.makedirs(os.path.dirname(args.config), exist_ok=True)
+        with open(args.config, "w") as f:
+            f.write(EXAMPLE_CONFIG)
+
+    program = [sys.executable, target, "run"]
+    if args.config != os.path.expanduser(CONFIG_PATH):
+        program += ["--config", args.config]
+    log_path = os.path.expanduser(LOG_PATH)
+    plist = os.path.expanduser(PLIST_PATH)
+    os.makedirs(os.path.dirname(plist), exist_ok=True)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(plist, "wb") as f:
+        plistlib.dump({
+            "Label": LABEL,
+            "ProgramArguments": program,
+            "RunAtLoad": True,
+            "KeepAlive": True,
+            "ProcessType": "Interactive",
+            "ThrottleInterval": 10,
+            "StandardOutPath": log_path,
+            "StandardErrorPath": log_path,
+        }, f)
+    launchctl_bootstrap(plist)
+    print(f"installed {target}\nconfig    {args.config}\nagent     {plist}\nlog       {log_path}\n")
+    status(args)
+
+
+def uninstall(args: argparse.Namespace) -> None:
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
+    for path in map(os.path.expanduser, (PLIST_PATH, INSTALL_PATH)):
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"removed {path}")
+    print(f"kept {args.config} and {os.path.expanduser(LOG_PATH)}")
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="claude-memguard", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("command", nargs="?", default="run", choices=["run", "status", "install", "uninstall"])
+    parser.add_argument("--config", default=os.environ.get("CLAUDE_MEMGUARD_CONFIG", CONFIG_PATH),
+                        help=f"settings file (default {CONFIG_PATH})")
+    parser.add_argument("--per-process", "--per-process-gb", dest="per_process", metavar="LIMIT",
+                        help="kill any one process over this (default 33%% of RAM)")
+    parser.add_argument("--total", "--total-gb", dest="total", metavar="LIMIT",
+                        help="kill an app's largest process when all it launched pass this (default 55%% of RAM)")
+    parser.add_argument("--min-free-pct", metavar="PCT", help="kill the largest process when free memory falls to this (default 10)")
+    parser.add_argument("--interval", metavar="SECONDS", help="seconds between checks (default 1)")
+    parser.add_argument("--cooldown", metavar="SECONDS", help="pause after a kill so memory can be reclaimed (default 3)")
+    parser.add_argument("--app", action="append", metavar="BUNDLE", help="app bundle to guard (repeatable; replaces the list)")
+    parser.add_argument("--protect", action="append", metavar="PREFIX", help="executable prefix never killed (repeatable; replaces the list)")
+    parser.add_argument("--no-notify", action="store_true", help="skip the macOS notification on a kill")
+    parser.add_argument("--dry-run", action="store_true", help="log WOULD KILL instead of killing")
+    parser.add_argument("--status", dest="status_flag", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--only-pid", type=int, help=argparse.SUPPRESS)
+    args = parser.parse_args(argv)
+    if args.status_flag:
+        args.command = "status"
+    args.config = os.path.abspath(os.path.expanduser(args.config))
+    if args.command in ("install", "uninstall") and flag_overrides(args):
+        parser.error(f"{args.command} takes no limit flags; set limits in {args.config}")
+    return args
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        {"run": run, "status": status, "install": install, "uninstall": uninstall}[args.command](args)
+    except ValueError as error:
+        sys.exit(f"claude-memguard: {error}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
